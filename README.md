@@ -5,7 +5,7 @@ Eine moderne, mobile-first Web-App zur Verwaltung wöchentlicher Supermarkt-Eink
 ## Funktionen
 
 - **Einkaufsliste**: Schnell hinzufügen mit Autovervollständigung, Favoriten, zuletzt/häufig gekauften Produkten, wiederkehrenden Vorschlägen und einer editierbaren Wochen-Vorlage. Reihenfolge per Drag-Ersatz (Auf/Ab) änderbar.
-- **Kassenzettel scannen**: Kamera-Foto (oder Datei-Upload) wird über eine austauschbare `ReceiptScannerService`-Schnittstelle verarbeitet. Aktuell als klar gekennzeichnetes **Demo-OCR** implementiert (läuft vollständig lokal, keine externen Anfragen) – Ergebnis wird vor dem Speichern in einer Kontrollansicht geprüft und editiert.
+- **Kassenzettel scannen**: Kamera-Foto (oder Datei-Upload) wird per **Tesseract.js** direkt im Browser per Texterkennung ausgewertet (dein Foto verlässt nie das Gerät). Markt, Datum, Summe und Produktzeilen werden automatisch erkannt – Ergebnis wird vor dem Speichern in einer Kontrollansicht geprüft und editiert, neue Produkte werden dabei automatisch im Produktkatalog angelegt.
 - **Barcode erfassen**: Manuelle Eingabe mit automatischem Abgleich gegen vorhandene Produkte (Duplikat-Erkennung).
 - **Produkte, Produktgruppen & Märkte**: Vollständige Verwaltung inkl. automatischer Kategorie-Zuordnung anhand von Schlüsselwörtern, die sich durch Nutzerkorrekturen verbessert.
 - **Einkaufshistorie**: Chronologische Übersicht vergangener Einkäufe mit Detailansicht.

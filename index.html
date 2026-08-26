@@ -907,12 +907,12 @@ function renderListItem(i, reorder, isFirst, isLast){
 }
 
 /* ============================= Scan ============================= */
-let scanState = { status:'idle', imageData:null, draft:null, error:null };
+let scanState = { status:'idle', imageData:null, draft:null, error:null, progress:0 };
 function viewScan(){
   return `
   <div class="stack">
     <h1 style="font-size:22px">Kassenzettel scannen</h1>
-    <div class="banner">ℹ️ Diese Version nutzt eine <b>simulierte Texterkennung (Demo-OCR)</b>, die lokal im Browser läuft. Es werden keine Bilder an externe Dienste gesendet.</div>
+    <div class="banner">ℹ️ Texterkennung läuft per <b>Tesseract.js vollständig im Browser</b> – dein Foto wird nicht an einen Server gesendet. Beim ersten Scan werden einmalig ein paar MB Sprachdaten geladen (danach zwischengespeichert), dafür ist kurz eine Internetverbindung nötig.</div>
 
     ${scanState.status==='idle' ? `
     <div class="card" style="text-align:center; padding:32px 20px">
@@ -934,7 +934,7 @@ function viewScan(){
     <div class="card" style="text-align:center; padding:28px">
       ${scanState.imageData? `<img class="receipt-photo" src="${scanState.imageData}" style="margin-bottom:16px">`:''}
       <div class="skeleton-bar" style="margin-bottom:12px"></div>
-      <p style="font-weight:700">Kassenzettel wird analysiert…</p>
+      <p style="font-weight:700">Kassenzettel wird analysiert… ${scanState.progress>0?scanState.progress+'%':''}</p>
       <p style="font-size:12.5px; color:var(--muted)">Produkte, Preise und Summe werden erkannt.</p>
     </div>` : ''}
 
@@ -957,8 +957,8 @@ function viewScanReview(){
   return `
   <div class="card">
     <div class="row between" style="margin-bottom:10px">
-      <h3 style="font-size:16px">Erkannter Einkauf</h3>
-      <span class="badge badge-demo">Demo-Scan</span>
+      <h3 style="font-size:16px">${d.imageData?'Erkannter Einkauf':'Manueller Einkauf'}</h3>
+      ${d.imageData?'<span class="badge badge-good">OCR-Scan</span>':''}
     </div>
     ${d.imageData? `<img class="receipt-photo" src="${d.imageData}" style="margin-bottom:14px">`:''}
     <div class="field-row" style="margin-bottom:10px">
@@ -977,7 +977,7 @@ function viewScanReview(){
         <tbody>
         ${d.items.map((it,idx)=>`
           <tr>
-            <td><input type="text" value="${escAttr(it.name)}" oninput="App.updateDraftItem(${idx},'name',this.value)" style="min-width:120px"></td>
+            <td><input type="text" value="${escAttr(it.name)}" oninput="App.updateDraftItem(${idx},'name',this.value)" style="min-width:120px">${it.isNew?'<span class="badge badge-good" style="margin-top:4px">Neu</span>':''}</td>
             <td style="white-space:nowrap"><input type="number" min="0" step="0.1" value="${it.quantity}" oninput="App.updateDraftItem(${idx},'quantity',this.value)" style="width:56px; display:inline-block; padding:8px 6px">
               <select style="width:64px; display:inline-block; padding:8px 4px" onchange="App.updateDraftItem(${idx},'unit',this.value)">${unitSelectOptions(it.unit)}</select></td>
             <td><input type="number" min="0" step="0.01" value="${it.price}" oninput="App.updateDraftItem(${idx},'price',this.value)" style="width:72px"></td>
@@ -1593,33 +1593,113 @@ function onReceiptFile(ev){
   reader.onerror = () => toast('Datei konnte nicht gelesen werden.', true);
   reader.onload = () => {
     compressImage(reader.result, 1000, 0.72).then(dataUrl=>{
-      scanState = { status:'scanning', imageData:dataUrl, draft:null, error:null };
-      render();
-      runMockScan(dataUrl);
+      runRealScan(dataUrl);
     });
   };
   reader.readAsDataURL(file);
 }
-async function runMockScan(imageData){
-  await new Promise(r=>setTimeout(r, 1200+Math.random()*700));
-  if(Math.random() < 0.07){
-    scanState = { status:'error', imageData, draft:null, error:'Es konnten keine Produkte auf dem Foto erkannt werden. Achte auf gute Beleuchtung und einen vollständigen, scharfen Kassenzettel.' };
-    render(); return;
+
+/* Tesseract.js wird erst bei Bedarf per CDN nachgeladen (kein Build-Schritt/Bundling
+   in diesem Projekt). Im Claude-Artifact-Viewer blockiert die strikte CSP externe
+   Skripte/Netzwerkzugriffe – das schlägt dort also fehl und landet gezielt im
+   error-Status mit "Manuell erfassen" als Ausweg; auf GitHub Pages/npx serve/file://
+   funktioniert es normal. */
+const TESSERACT_CDN = 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';
+let tesseractLoadPromise = null;
+function loadTesseract(){
+  if(window.Tesseract) return Promise.resolve(window.Tesseract);
+  if(tesseractLoadPromise) return tesseractLoadPromise;
+  tesseractLoadPromise = new Promise((resolve, reject)=>{
+    const timer = setTimeout(()=>reject(new Error('Zeitüberschreitung beim Laden der Texterkennung')), 15000);
+    const s = document.createElement('script');
+    s.src = TESSERACT_CDN;
+    s.onload = () => { clearTimeout(timer); window.Tesseract ? resolve(window.Tesseract) : reject(new Error('Texterkennung nicht verfügbar')); };
+    s.onerror = () => { clearTimeout(timer); reject(new Error('Texterkennung konnte nicht geladen werden (keine Internetverbindung oder durch Sandbox blockiert)')); };
+    document.head.appendChild(s);
+  });
+  tesseractLoadPromise.catch(()=>{ tesseractLoadPromise = null; });
+  return tesseractLoadPromise;
+}
+async function runRealScan(imageData){
+  scanState = { status:'scanning', imageData, draft:null, error:null, progress:0 };
+  render();
+  try{
+    const Tesseract = await loadTesseract();
+    const { data } = await Tesseract.recognize(imageData, 'deu', {
+      logger: m => {
+        if(m.status==='recognizing text' && typeof m.progress==='number'){
+          const pct = Math.round(m.progress*100);
+          if(pct !== scanState.progress && scanState.status==='scanning'){ scanState.progress = pct; render(); }
+        }
+      }
+    });
+    const draft = parseReceiptText(data.text, imageData);
+    if(!draft.items.length){
+      scanState = { status:'error', imageData, draft:null, error:'Es konnten keine Produkte auf dem Foto erkannt werden. Achte auf gute Beleuchtung und einen vollständigen, scharfen Kassenzettel.' };
+    } else {
+      scanState = { status:'review', imageData, draft, error:null };
+    }
+  }catch(err){
+    scanState = { status:'error', imageData, draft:null, error: (err && err.message) || 'Texterkennung fehlgeschlagen.' };
   }
-  scanState = { status:'review', imageData, draft: mockGenerateReceipt(imageData), error:null };
   render();
 }
-function mockGenerateReceipt(imageData){
-  const pool = store.markets.filter(m=>m.name!=='Sonstige');
-  const market = pick(pool.length?pool:store.markets).name;
-  const n = 4 + Math.floor(Math.random()*6);
-  const chosen = [...DEMO_PRODUCT_POOL].sort(()=>Math.random()-0.5).slice(0,n);
-  const items = chosen.map(([name,,unit,qty,price])=>{
-    const jitter = 1 + (Math.random()*0.14-0.07);
-    return { name, quantity:qty, unit, price: Math.max(0.29, Math.round(price*jitter*100)/100), categoryId: classifyProduct(name) };
-  });
-  const total = Math.round(items.reduce((a,i)=>a+i.price,0)*100)/100;
-  return { market, date:new Date().toISOString(), total, items, imageData };
+const RECEIPT_NOISE = /(summe|gesamt|total|zwischensumme|zu\s*zahlen|gegeben|rückgeld|zurück|\bbar\b|ec[- ]?cash|kartenzahlung|girocard|mwst|\bust\b|steuer|\bnetto\b|\bbrutto\b|\btse\b|kassenbon|\bbeleg\b|bon-?nr|kunden-?nr|trans-?nr|vielen dank|betrag|öffnungszeiten|tel\.?:|www\.|straße|strasse|\bstr\.|geöffnet|kassierer|bediener|pfand|uhrzeit|datum)/i;
+function parseReceiptText(text, imageData){
+  const rawLines = String(text||'').split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+
+  let market = null;
+  const knownMarkets = store.markets.filter(m=>m.name!=='Sonstige');
+  for(const line of rawLines.slice(0,8)){
+    const hit = knownMarkets.find(m => normName(line).includes(normName(m.name)));
+    if(hit){ market = hit.name; break; }
+  }
+  if(!market) market = (knownMarkets[0] || store.markets[0]).name;
+
+  let date = new Date().toISOString();
+  const dateMatch = text.match(/\b(\d{1,2})[.\/](\d{1,2})[.\/](\d{2,4})\b/);
+  if(dateMatch){
+    let [, d, mo, y] = dateMatch;
+    if(y.length===2) y = '20'+y;
+    const parsed = new Date(+y, +mo-1, +d);
+    if(!isNaN(parsed)) date = parsed.toISOString();
+  }
+
+  let total = null;
+  const totalLine = rawLines.find(l => /(summe|gesamt|total)/i.test(l) && !/zwischensumme/i.test(l));
+  if(totalLine){
+    const nums = totalLine.match(/(\d{1,4}[.,]\d{2})/g);
+    if(nums) total = parseFloat(nums[nums.length-1].replace(',','.'));
+  }
+
+  const items = [];
+  const priceRe = /(\d{1,4}[.,]\d{2})\s*[A-Za-z]?\s*$/;
+  const qtyRe = /^(\d{1,2})\s*[xX]\s*/;
+  for(const line of rawLines){
+    if(RECEIPT_NOISE.test(line)) continue;
+    if(/^[\d.,\s]+$/.test(line)) continue;
+    const priceMatch = line.match(priceRe);
+    if(!priceMatch) continue;
+    let name = line.slice(0, priceMatch.index).trim();
+    let quantity = 1;
+    const qtyMatch = name.match(qtyRe);
+    if(qtyMatch){ quantity = parseInt(qtyMatch[1],10) || 1; name = name.slice(qtyMatch[0].length).trim(); }
+    name = name.replace(/[*#]+$/,'').trim();
+    if(name.length < 2 || normName(name) === normName(market)) continue;
+    const price = parseFloat(priceMatch[1].replace(',','.'));
+    if(!(price > 0) || price > 500) continue;
+    const existing = store.products.find(p => normName(p.name) === normName(name));
+    items.push({
+      name,
+      quantity,
+      unit: existing ? existing.defaultUnit : 'Stück',
+      price: Math.round(price*100)/100,
+      categoryId: existing ? existing.categoryId : classifyProduct(name),
+      isNew: !existing,
+    });
+  }
+
+  return { market, date, total, items, imageData };
 }
 function startManualEntry(){
   scanState = { status:'review', imageData:null, draft:{ market: store.markets[0].name, date:new Date().toISOString(), total:null, items:[], imageData:null }, error:null };
