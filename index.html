@@ -1673,20 +1673,21 @@ function parseReceiptText(text, imageData){
   }
 
   const items = [];
-  const priceRe = /(\d{1,4}[.,]\d{2})\s*[A-Za-z]?\s*$/;
+  const priceRe = /(-)?\s*(\d{1,4}[.,]\d{2})\s*[A-Za-z]?\s*$/;
   const qtyRe = /^(\d{1,2})\s*[xX]\s*/;
   for(const line of rawLines){
     if(RECEIPT_NOISE.test(line)) continue;
-    if(/^[\d.,\s]+$/.test(line)) continue;
+    if(/^[\d.,\s-]+$/.test(line)) continue;
     const priceMatch = line.match(priceRe);
     if(!priceMatch) continue;
+    if(priceMatch[1] === '-') continue; // negative Beträge (Rabatt, Pfand-Rückgabe, Storno) nicht als Produkt importieren
     let name = line.slice(0, priceMatch.index).trim();
     let quantity = 1;
     const qtyMatch = name.match(qtyRe);
     if(qtyMatch){ quantity = parseInt(qtyMatch[1],10) || 1; name = name.slice(qtyMatch[0].length).trim(); }
     name = name.replace(/[*#]+$/,'').trim();
     if(name.length < 2 || normName(name) === normName(market)) continue;
-    const price = parseFloat(priceMatch[1].replace(',','.'));
+    const price = parseFloat(priceMatch[2].replace(',','.'));
     if(!(price > 0) || price > 500) continue;
     const existing = store.products.find(p => normName(p.name) === normName(name));
     items.push({
