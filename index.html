@@ -953,7 +953,10 @@ function viewScan(){
 function viewScanReview(){
   const d = scanState.draft;
   const computedTotal = d.items.reduce((a,i)=>a+(i.price||0),0);
-  const mismatch = d.total && Math.abs(computedTotal - d.total) > 0.02;
+  // Pfand/Rabatt/Leergut stecken im Bon-Total, werden aber nicht als Position importiert (siehe parseReceiptText) –
+  // deshalb hier gegenrechnen, statt die Erkennung fälschlich als fehlerhaft zu melden.
+  const expectedTotal = d.total!=null ? Math.round((d.total - (d.excludedAdjustment||0))*100)/100 : null;
+  const mismatch = expectedTotal!=null && Math.abs(computedTotal - expectedTotal) > 0.02;
   return `
   <div class="card">
     <div class="row between" style="margin-bottom:10px">
@@ -993,7 +996,7 @@ function viewScanReview(){
       <span style="font-weight:700">Summe</span>
       <span class="hero-num tabular" id="scan-total" style="font-size:22px">${fmtEUR(computedTotal)}</span>
     </div>
-    ${mismatch ? `<p style="font-size:12px; color:var(--warn); margin-top:4px">⚠️ Erkannte Gesamtsumme auf dem Beleg war ${fmtEUR(d.total)} – bitte Preise prüfen.</p>`:''}
+    ${mismatch ? `<p style="font-size:12px; color:var(--warn); margin-top:4px">⚠️ Laut Bon-Summe (${fmtEUR(d.total)}${d.excludedAdjustment?', abzüglich Pfand/Rabatt':''}) sollten die Produkte ${fmtEUR(expectedTotal)} ergeben – bitte Preise prüfen.</p>`:''}
   </div>
   <div class="row" style="gap:10px">
     <button class="btn btn-outline btn-block" onclick="App.cancelScan()">Abbrechen</button>
@@ -1673,18 +1676,41 @@ function parseReceiptText(text, imageData){
   }
 
   const items = [];
+  // Beträge, die im Bon-Total stecken, aber bewusst nicht als Position importiert werden
+  // (Pfand-Zeilen zählen positiv zum Bon-Total hinzu, Rabatt/Leergut-Rückgaben negativ) –
+  // wird beim Summen-Abgleich in der Review-Ansicht gegengerechnet, siehe viewScanReview().
+  let excludedAdjustment = 0;
   const priceRe = /(-)?\s*(\d{1,4}[.,]\d{2})\s*[A-Za-z]?\s*$/;
-  const qtyRe = /^(\d{1,2})\s*[xX]\s*/;
+  const qtyPrefixRe = /^(\d{1,2})\s*[xX]\s*/;
+  const qtyMultRe = /(\d{1,2})\s*[*xX]\s*\d{1,3}[.,]\d{2}\s*$/; // "2 * 0,79" (Menge * Einzelpreis) am Zeilenende
   for(const line of rawLines){
-    if(RECEIPT_NOISE.test(line)) continue;
+    if(RECEIPT_NOISE.test(line)){
+      if(/pfand/i.test(line)){
+        const pfandMatch = line.match(priceRe);
+        if(pfandMatch && pfandMatch[1] !== '-') excludedAdjustment += parseFloat(pfandMatch[2].replace(',','.'));
+      }
+      continue;
+    }
     if(/^[\d.,\s-]+$/.test(line)) continue;
     const priceMatch = line.match(priceRe);
     if(!priceMatch) continue;
-    if(priceMatch[1] === '-') continue; // negative Beträge (Rabatt, Pfand-Rückgabe, Storno) nicht als Produkt importieren
+    if(priceMatch[1] === '-'){
+      excludedAdjustment -= parseFloat(priceMatch[2].replace(',','.')); // negative Beträge (Rabatt, Pfand-Rückgabe, Storno) nicht als Produkt importieren
+      continue;
+    }
     let name = line.slice(0, priceMatch.index).trim();
     let quantity = 1;
-    const qtyMatch = name.match(qtyRe);
-    if(qtyMatch){ quantity = parseInt(qtyMatch[1],10) || 1; name = name.slice(qtyMatch[0].length).trim(); }
+    const qtyPrefixMatch = name.match(qtyPrefixRe);
+    if(qtyPrefixMatch){
+      quantity = parseInt(qtyPrefixMatch[1],10) || 1;
+      name = name.slice(qtyPrefixMatch[0].length).trim();
+    } else {
+      const qtyMultMatch = name.match(qtyMultRe);
+      if(qtyMultMatch){
+        quantity = parseInt(qtyMultMatch[1],10) || 1;
+        name = name.slice(0, qtyMultMatch.index).trim();
+      }
+    }
     name = name.replace(/[*#]+$/,'').trim();
     if(name.length < 2 || normName(name) === normName(market)) continue;
     const price = parseFloat(priceMatch[2].replace(',','.'));
@@ -1700,7 +1726,7 @@ function parseReceiptText(text, imageData){
     });
   }
 
-  return { market, date, total, items, imageData };
+  return { market, date, total, items, imageData, excludedAdjustment: Math.round(excludedAdjustment*100)/100 };
 }
 function startManualEntry(){
   scanState = { status:'review', imageData:null, draft:{ market: store.markets[0].name, date:new Date().toISOString(), total:null, items:[], imageData:null }, error:null };
