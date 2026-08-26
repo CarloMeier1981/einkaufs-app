@@ -1629,6 +1629,7 @@ async function runRealScan(imageData){
   try{
     const Tesseract = await loadTesseract();
     const { data } = await Tesseract.recognize(imageData, 'deu', {
+      tessedit_pageseg_mode: '6', // "einheitlicher Textblock" statt automatischer Layout-Erkennung – zuverlässiger für schmale Kassenzettel-Spalten
       logger: m => {
         if(m.status==='recognizing text' && typeof m.progress==='number'){
           const pct = Math.round(m.progress*100);
@@ -1669,11 +1670,16 @@ function parseReceiptText(text, imageData){
   }
 
   let total = null;
-  const totalLine = rawLines.find(l => /(summe|gesamt|total)/i.test(l) && !/zwischensumme/i.test(l));
+  const totalLineIndex = rawLines.findIndex(l => /(summe|gesamt|total)/i.test(l) && !/zwischensumme/i.test(l));
+  const totalLine = totalLineIndex >= 0 ? rawLines[totalLineIndex] : null;
   if(totalLine){
     const nums = totalLine.match(/(\d{1,4}[.,]\d{2})/g);
     if(nums) total = parseFloat(nums[nums.length-1].replace(',','.'));
   }
+  // Alles ab der Summenzeile (Zahlungsart, Steuer-Aufschlüsselung, Kundenbeleg, ...) ist
+  // garantiert kein Produkt mehr – wird für die Positionserkennung komplett ignoriert,
+  // statt sich auf einzelne RECEIPT_NOISE-Stichwörter zu verlassen.
+  const itemLines = totalLineIndex >= 0 ? rawLines.slice(0, totalLineIndex) : rawLines;
 
   const items = [];
   // Beträge, die im Bon-Total stecken, aber bewusst nicht als Position importiert werden
@@ -1683,7 +1689,7 @@ function parseReceiptText(text, imageData){
   const priceRe = /(-)?\s*(\d{1,4}[.,]\d{2})\s*[A-Za-z]?\s*$/;
   const qtyPrefixRe = /^(\d{1,2})\s*[xX]\s*/;
   const qtyMultRe = /(\d{1,2})\s*[*xX]\s*\d{1,3}[.,]\d{2}\s*$/; // "2 * 0,79" (Menge * Einzelpreis) am Zeilenende
-  for(const line of rawLines){
+  for(const line of itemLines){
     if(RECEIPT_NOISE.test(line)){
       if(/pfand/i.test(line)){
         const pfandMatch = line.match(priceRe);
