@@ -298,6 +298,19 @@ tr:last-child td{border-bottom:none}
 .suggest-item:last-child{border-bottom:none}
 .suggest-item:active{background:var(--accent-soft)}
 
+.voice-inputrow{display:flex; align-items:center; gap:8px}
+.voice-inputrow input{flex:1; min-width:0}
+.mic-btn{
+  flex-shrink:0; width:44px; height:44px; border-radius:var(--radius-ctl); border:1px solid var(--line);
+  background:var(--surface); color:var(--ink-2); font-size:17px; display:flex; align-items:center; justify-content:center;
+}
+.mic-btn:hover{border-color:var(--accent); color:var(--accent); box-shadow:var(--glow-sm)}
+.mic-btn:active{transform:scale(.94)}
+.mic-btn.listening{background:var(--critical-soft); border-color:var(--critical); color:var(--critical); box-shadow:0 0 16px rgba(255,59,92,.4)}
+@media (prefers-reduced-motion:no-preference){ .mic-btn.listening{animation:mic-pulse 1.4s ease-in-out infinite} }
+@keyframes mic-pulse{ 0%,100%{box-shadow:0 0 10px rgba(255,59,92,.35)} 50%{box-shadow:0 0 22px rgba(255,59,92,.65)} }
+.voice-echo{font-size:12px; color:var(--muted); margin-top:8px}
+
 .skeleton-bar{height:120px; border-radius:4px; background:linear-gradient(90deg,var(--plane),var(--surface-2),var(--plane)); background-size:200% 100%; border:1px solid var(--line)}
 @media (prefers-reduced-motion:no-preference){ .skeleton-bar{animation:shimmer 1.3s ease infinite} }
 @keyframes shimmer{ 0%{background-position:200% 0} 100%{background-position:-200% 0} }
@@ -368,6 +381,22 @@ const DEFAULT_CATEGORIES = [
 ];
 const DEFAULT_MARKETS = ['REWE','EDEKA','Lidl','Aldi','Kaufland','dm','Rossmann','Sonstige'];
 const UNITS = ['Stück','kg','g','Liter','ml','Packung','Bund','Dose','Glas'];
+
+const VOICE_NUMBER_WORDS = {
+  'ein':1,'eine':1,'einen':1,'einer':1,'eins':1,
+  'zwei':2,'drei':3,'vier':4,'fünf':5,'fuenf':5,'sechs':6,'sieben':7,'acht':8,'neun':9,'zehn':10,'elf':11,'zwölf':12,'zwoelf':12,
+};
+const VOICE_UNIT_WORDS = {
+  'liter':'Liter','l':'Liter',
+  'kg':'kg','kilo':'kg','kilogramm':'kg',
+  'g':'g','gramm':'g',
+  'ml':'ml','milliliter':'ml',
+  'packung':'Packung','packungen':'Packung','paket':'Packung','pakete':'Packung',
+  'dose':'Dose','dosen':'Dose',
+  'glas':'Glas','gläser':'Glas','glaeser':'Glas',
+  'bund':'Bund',
+  'stück':'Stück','stueck':'Stück','stk':'Stück',
+};
 
 const CATEGORY_KEYWORDS = {
   milch:['milch','joghurt','käse','kase','quark','sahne','butter','frischkäse','mozzarella','skyr'],
@@ -782,6 +811,10 @@ function drawDashboardMiniChart(){ /* reserved */ }
 let listAddQuery = '';
 let listFilterTab = 'zuletzt';
 let reorderMode = false;
+let voiceState = { status:'idle' }; // idle | listening
+let voiceRecognition = null;
+let voiceDraft = null;
+let voiceRawText = '';
 
 function suggestProducts(query){
   const n = normName(query);
@@ -827,8 +860,12 @@ function viewListe(){
 
     <div class="card">
       <div class="searchbox">
-        <input type="text" id="add-input" placeholder="Produkt hinzufügen…" value="${escAttr(listAddQuery)}"
-          oninput="App.onListSearch(this.value)" onkeydown="if(event.key==='Enter'){App.quickAddByName(this.value)}">
+        <div class="voice-inputrow">
+          <input type="text" id="add-input" placeholder="Produkt hinzufügen…" value="${escAttr(listAddQuery)}"
+            oninput="App.onListSearch(this.value)" onkeydown="if(event.key==='Enter'){App.quickAddByName(this.value)}">
+          <button type="button" class="mic-btn ${voiceState.status==='listening'?'listening':''}" aria-label="${voiceState.status==='listening'?'Aufnahme beenden':'Per Sprache hinzufügen'}" title="${voiceState.status==='listening'?'Aufnahme beenden':'Per Sprache hinzufügen'}" onclick="App.startVoiceInput()">${voiceState.status==='listening'?'⏹️':'🎤'}</button>
+        </div>
+        ${voiceState.status==='listening' ? `<div class="voice-echo">🎙️ Ich höre zu … sprich die Produkte, die du hinzufügen möchtest.</div>` : ''}
         ${suggestions.length || listAddQuery ? `<div class="suggest">
           ${suggestions.map(p=>`<div class="suggest-item" onclick="App.quickAddToList('${p.id}')">${catIconEl(p.categoryId)}<div style="flex:1"><div style="font-weight:700; font-size:13.5px">${esc(p.name)}</div><div style="font-size:11.5px; color:var(--muted)">${p.defaultQuantity} ${esc(p.defaultUnit)}${catById(p.categoryId)?' · '+esc(catById(p.categoryId).name):''}</div></div>${p.favorite?'⭐':''}</div>`).join('')}
           ${listAddQuery.trim() && !store.products.some(p=>normName(p.name)===normName(listAddQuery)) ? `<div class="suggest-item" onclick="App.quickAddByName('${escAttr(listAddQuery)}')" style="color:var(--accent); font-weight:700">➕ „${esc(listAddQuery)}" neu anlegen</div>`:''}
@@ -911,6 +948,25 @@ function renderListItem(i, reorder, isFirst, isLast){
       <button class="iconbtn-sm" onclick="event.stopPropagation();App.editItem('${i.id}')">✏️</button>
       <button class="iconbtn-sm" onclick="event.stopPropagation();App.removeItem('${i.id}')">🗑️</button>
     </div>
+  </div>`;
+}
+
+function voiceDraftModalHtml(){
+  return `
+  <div class="modal-head"><h3>🎤 Erkannt</h3><button class="icon-btn" onclick="App.closeModal()">✕</button></div>
+  <p class="voice-echo" style="margin-bottom:14px">„${esc(voiceRawText)}"</p>
+  ${voiceDraft.length ? `<div class="stack" style="gap:8px">
+    ${voiceDraft.map((it,idx)=>`
+    <div class="row" style="gap:8px">
+      <input type="number" min="0" step="0.1" value="${it.quantity}" style="width:64px; flex-shrink:0" oninput="App.updateVoiceDraftItem(${idx},'quantity',this.value)">
+      <select style="width:104px; flex-shrink:0" onchange="App.updateVoiceDraftItem(${idx},'unit',this.value)">${unitSelectOptions(it.unit||'Stück')}</select>
+      <input type="text" value="${escAttr(it.name)}" style="flex:1; min-width:0" oninput="App.updateVoiceDraftItem(${idx},'name',this.value)">
+      <button type="button" class="iconbtn-sm" style="flex-shrink:0" onclick="App.removeVoiceDraftItem(${idx})">🗑️</button>
+    </div>`).join('')}
+  </div>` : emptyState('🤷','Keine Produkte übrig.','Alle erkannten Produkte wurden entfernt.')}
+  <div class="row" style="gap:10px; margin-top:16px">
+    <button type="button" class="btn btn-outline btn-block" onclick="App.closeModal()">Abbrechen</button>
+    <button type="button" class="btn btn-primary btn-block" ${voiceDraft.length?'':'disabled'} onclick="App.confirmVoiceItems()">${voiceDraft.length ? voiceDraft.length+' hinzufügen' : 'Hinzufügen'}</button>
   </div>`;
 }
 
@@ -1460,11 +1516,11 @@ function onListSearch(v){
   listAddQuery = v; render();
   setTimeout(()=>{ const el=document.getElementById('add-input'); if(el){ el.focus(); el.setSelectionRange(el.value.length,el.value.length); } },0);
 }
-function addItemCore(productId){
+function addItemCore(productId, quantity, unit){
   const p = prodById(productId); if(!p) return false;
   if(store.shoppingList.some(i=>i.productId===productId && !i.checked)) return false;
   const maxOrder = store.shoppingList.reduce((m,i)=>Math.max(m,i.order||0),-1);
-  store.shoppingList.push({ id:uid(), productId:p.id, name:p.name, quantity:p.defaultQuantity||1, unit:p.defaultUnit||'Stück',
+  store.shoppingList.push({ id:uid(), productId:p.id, name:p.name, quantity: quantity||p.defaultQuantity||1, unit: unit||p.defaultUnit||'Stück',
     categoryId:p.categoryId, estimatedPrice: p.defaultPrice ?? null, checked:false, note:'', order:maxOrder+1, createdAt:nowIso(), purchasedAt:null });
   return true;
 }
@@ -1481,6 +1537,129 @@ function quickAddByName(name){
   listAddQuery = '';
   quickAddToList(p.id);
 }
+
+/* ---- Voice input (Web Speech API) ---- */
+const VOICE_LEAD_RE = /^(bitte\s+|füge\s+|fuege\s+|setze\s+|kaufe\s+noch\s+|kaufe\s+|hol\s+mir\s+noch\s+|hol\s+mir\s+|hol\s+noch\s+|hol\s+|besorge\s+noch\s+|besorge\s+|ich\s+brauche\s+noch\s+|ich\s+brauche\s+|wir\s+brauchen\s+noch\s+|wir\s+brauchen\s+)+/i;
+const VOICE_TAIL_RE = /(\s+auf\s+die\s+einkaufsliste|\s+auf\s+die\s+liste|\s+auf\s+meine\s+liste|\s+hinzufügen|\s+hinzufuegen|\s+hinzu|\s+dazu)+[.!\s]*$/i;
+const VOICE_LEAD_WORD_RE = /^(noch|auch|dann|außerdem|ausserdem|und)\s+/i;
+const VOICE_ARTICLE_RE = /^(der|die|das|den|dem)\s+/i;
+
+function parseVoiceCommand(text){
+  let t = text.trim().replace(/[.!?]+$/,'');
+  t = t.replace(VOICE_LEAD_RE, '').replace(VOICE_TAIL_RE, '').trim();
+  if(!t) return [];
+  const segments = t.split(/\s*,\s*|\s+und\s+|\s+sowie\s+|\s*\+\s*/i);
+  const items = [];
+  segments.forEach(seg=>{
+    seg = seg.trim().replace(VOICE_LEAD_WORD_RE, '').trim();
+    if(!seg) return;
+    let quantity = null;
+    const digitMatch = seg.match(/^(\d+(?:[.,]\d+)?)\s+(.+)$/);
+    if(digitMatch){
+      quantity = parseFloat(digitMatch[1].replace(',', '.'));
+      seg = digitMatch[2];
+    } else {
+      const wordMatch = seg.match(/^([a-zäöüß]+)\s+(.+)$/i);
+      if(wordMatch && VOICE_NUMBER_WORDS[wordMatch[1].toLowerCase()]){
+        quantity = VOICE_NUMBER_WORDS[wordMatch[1].toLowerCase()];
+        seg = wordMatch[2];
+      }
+    }
+    let unit = null;
+    const unitMatch = seg.match(/^([a-zäöüß]+)\s+(.+)$/i);
+    if(unitMatch && VOICE_UNIT_WORDS[unitMatch[1].toLowerCase()]){
+      unit = VOICE_UNIT_WORDS[unitMatch[1].toLowerCase()];
+      seg = unitMatch[2];
+    }
+    seg = seg.replace(VOICE_ARTICLE_RE, '').trim();
+    if(!seg) return;
+    const name = seg.charAt(0).toUpperCase() + seg.slice(1);
+    items.push({ name, quantity: quantity || 1, unit });
+  });
+  return items;
+}
+
+function startVoiceInput(){
+  if(voiceState.status==='listening'){
+    if(voiceRecognition){ try{ voiceRecognition.stop(); }catch(e){} }
+    return;
+  }
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if(!SR){ toast('Spracheingabe wird von diesem Gerät/Browser nicht unterstützt.', true); return; }
+  let rec;
+  try{ rec = new SR(); }
+  catch(e){ toast('Spracheingabe konnte nicht gestartet werden.', true); return; }
+  voiceRecognition = rec;
+  rec.lang = 'de-DE'; rec.continuous = false; rec.interimResults = false; rec.maxAlternatives = 1;
+  let handled = false;
+  rec.onresult = (e)=>{
+    handled = true;
+    const transcript = (e.results && e.results[0] && e.results[0][0]) ? e.results[0][0].transcript : '';
+    voiceState = { status:'idle' };
+    processVoiceTranscript(transcript);
+  };
+  rec.onerror = (e)=>{
+    handled = true;
+    voiceState = { status:'idle' };
+    const messages = {
+      'not-allowed':'Mikrofonzugriff wurde verweigert. Bitte erlaube den Zugriff in den Browser-Einstellungen.',
+      'service-not-allowed':'Mikrofonzugriff wurde verweigert. Bitte erlaube den Zugriff in den Browser-Einstellungen.',
+      'no-speech':'Keine Sprache erkannt. Bitte versuche es erneut.',
+      'audio-capture':'Es wurde kein Mikrofon gefunden.',
+      'network':'Spracherkennung fehlgeschlagen (Netzwerkproblem). Bitte erneut versuchen.',
+      'aborted': null,
+    };
+    const msg = messages.hasOwnProperty(e.error) ? messages[e.error] : 'Spracherkennung fehlgeschlagen. Bitte erneut versuchen.';
+    if(msg) toast(msg, true);
+    render();
+  };
+  rec.onend = ()=>{
+    if(!handled){ voiceState = { status:'idle' }; render(); }
+    voiceRecognition = null;
+  };
+  try{
+    rec.start();
+    voiceState = { status:'listening' };
+    render();
+  }catch(e){
+    voiceState = { status:'idle' };
+    toast('Spracheingabe konnte nicht gestartet werden.', true);
+  }
+}
+function processVoiceTranscript(transcript){
+  const text = (transcript||'').trim();
+  if(!text){ toast('Nichts verstanden. Bitte erneut versuchen.', true); render(); return; }
+  const items = parseVoiceCommand(text);
+  if(!items.length){ toast('Konnte keine Produkte aus „'+text+'" erkennen.', true); render(); return; }
+  voiceDraft = items; voiceRawText = text;
+  render();
+  openModal(voiceDraftModalHtml());
+}
+function updateVoiceDraftItem(idx, field, val){
+  if(!voiceDraft || !voiceDraft[idx]) return;
+  voiceDraft[idx][field] = field==='quantity' ? (parseFloat(val)||1) : val;
+}
+function removeVoiceDraftItem(idx){
+  if(!voiceDraft) return;
+  voiceDraft.splice(idx,1);
+  openModal(voiceDraftModalHtml());
+}
+function confirmVoiceItems(){
+  if(!voiceDraft || !voiceDraft.length){ closeModal(); return; }
+  let added=0, skipped=0;
+  voiceDraft.forEach(it=>{
+    const name = (it.name||'').trim(); if(!name) return;
+    let p = store.products.find(pp=>normName(pp.name)===normName(name));
+    if(!p) p = findOrCreateProduct(name, classifyProduct(name), it.unit || undefined);
+    const ok = addItemCore(p.id, it.quantity, it.unit || undefined);
+    if(ok) added++; else skipped++;
+  });
+  voiceDraft = null; voiceRawText = '';
+  saveStore(); closeModal(); render();
+  if(added) toast(added+' Produkt'+(added>1?'e':'')+' hinzugefügt'+(skipped?(' · '+skipped+' bereits auf der Liste'):''));
+  else toast('Alle Produkte waren bereits auf der Liste.');
+}
+
 function recurringCandidates(){
   const list = store.shoppingList;
   return store.products.filter(p=>{
@@ -2131,6 +2310,7 @@ function finishOnboarding(withDemo){
 
 const App = {
   nav, toggleItem, removeItem, moveItem, toggleReorder, setListTab, onListSearch, quickAddToList, quickAddByName,
+  startVoiceInput, updateVoiceDraftItem, removeVoiceDraftItem, confirmVoiceItems,
   addAllRecurring, addTemplateToList, editItem, saveItemForm, openCompletePurchase, updateCompleteTotal, completePurchase,
   onReceiptFile, startManualEntry, resetScan, cancelScan, confirmScan, updateDraft, updateDraftItem, addDraftItem, removeDraftItem,
   openBarcodeModal, submitBarcode, openEditShopping, saveShoppingForm, deleteShopping, setStatFilter, setStatCustom, setStatProduct,
