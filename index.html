@@ -193,6 +193,7 @@ main{flex:1; width:100%; max-width:760px; margin:0 auto; padding:20px 16px 100px
 .btn-danger:hover{box-shadow:0 0 14px rgba(255,59,92,.3)}
 .btn-block{width:100%}
 .btn-sm{padding:8px 14px; font-size:11px; min-height:36px}
+.btn:disabled{opacity:.45; cursor:not-allowed; box-shadow:none}
 .fab-scan{
   display:flex; align-items:center; gap:10px; justify-content:center; width:100%; padding:16px; border-radius:var(--radius-ctl);
   background:linear-gradient(135deg, var(--accent2), #0B5FCC); color:#fff; font-weight:700; font-size:13px;
@@ -274,6 +275,7 @@ select{appearance:none; background-image:linear-gradient(45deg,transparent 50%,v
 .badge-demo{background:var(--accent2-soft); color:var(--accent2); border-color:var(--accent2)}
 .badge-good{background:var(--good-soft); color:var(--good); border-color:var(--good)}
 .badge-critical{background:var(--critical-soft); color:var(--critical); border-color:var(--critical)}
+.badge-warn{background:color-mix(in srgb, var(--warn) 18%, var(--plane)); color:var(--warn); border-color:var(--warn)}
 
 .tablewrap{overflow-x:auto}
 table{width:100%; border-collapse:collapse; font-size:13px}
@@ -382,6 +384,13 @@ const DEFAULT_CATEGORIES = [
 const DEFAULT_MARKETS = ['REWE','EDEKA','Lidl','Aldi','Kaufland','dm','Rossmann','Sonstige'];
 const UNITS = ['Stück','kg','g','Liter','ml','Packung','Bund','Dose','Glas'];
 
+/* REWE hat keine öffentliche Bestell-/Warenkorb-API für Drittanwendungen (Stand Recherche 2026) –
+   deshalb nur diese zwei fest verdrahteten, echten rewe.de-Zieladressen für die Weiterleitung,
+   niemals aus Nutzereingaben zusammengesetzte URLs. */
+const REWE_SHOP_URL = 'https://www.rewe.de/shop/';
+const REWE_MARKET_SEARCH_URL = 'https://www.rewe.de/marktsuche';
+const REWE_ALLOWED_HOSTS = ['rewe.de','www.rewe.de','shop.rewe.de'];
+
 const VOICE_NUMBER_WORDS = {
   'ein':1,'eine':1,'einen':1,'einer':1,'eins':1,
   'zwei':2,'drei':3,'vier':4,'fünf':5,'fuenf':5,'sechs':6,'sieben':7,'acht':8,'neun':9,'zehn':10,'elf':11,'zwölf':12,'zwoelf':12,
@@ -448,6 +457,7 @@ function freshStore(){
     shoppings: [],
     priceHistory: [],
     markets: [],
+    reweOrders: [],
     categoryCorrections: {},
     settings: { theme:'system', firstRunDone:false, demoActive:false, recurringTemplate:[] },
   };
@@ -470,6 +480,7 @@ function loadStore(){
   if(!store.settings) store.settings = { theme:'system', firstRunDone:false, demoActive:false, recurringTemplate:[] };
   if(!store.categoryCorrections) store.categoryCorrections = {};
   if(!Array.isArray(store.priceHistory)) store.priceHistory = [];
+  if(!Array.isArray(store.reweOrders)) store.reweOrders = [];
 }
 function saveStore(){
   if(!storageOK) return;
@@ -710,6 +721,21 @@ function unitSelectOptions(selected){
 function marketSelectOptions(selectedName){
   return store.markets.map(m=>`<option value="${esc(m.name)}" ${m.name===selectedName?'selected':''}>${esc(m.name)}</option>`).join('');
 }
+function marketAddressLines(m){
+  const lines = [];
+  if(m.street) lines.push(m.street);
+  const cityLine = [m.zip, m.city].filter(Boolean).join(' ');
+  if(cityLine) lines.push(cityLine);
+  return lines;
+}
+function isReweMarket(m){ return /rewe/.test(normName(m.name)); }
+const REWE_ORDER_STATUS_LABELS = {
+  draft:'Entwurf', prepared:'Vorbereitet', redirected:'Weitergeleitet', completed:'Abgeschlossen', cancelled:'Abgebrochen',
+};
+function reweOrderStatusBadge(status){
+  const cls = status==='completed' ? 'badge-good' : status==='redirected' ? 'badge-good' : status==='cancelled' ? 'badge-critical' : 'badge-warn';
+  return `<span class="badge ${cls}">${esc(REWE_ORDER_STATUS_LABELS[status]||status)}</span>`;
+}
 function emptyState(emoji, title, sub){
   return `<div class="empty"><span class="emoji">${emoji}</span><div class="t1">${esc(title)}</div>${sub?`<p>${esc(sub)}</p>`:''}</div>`;
 }
@@ -815,6 +841,7 @@ let voiceState = { status:'idle' }; // idle | listening
 let voiceRecognition = null;
 let voiceDraft = null;
 let voiceRawText = '';
+let reweOrderDraft = null; // {step:'market'|'items'|'summary', marketId, orderId, items:[{productId,name,unit,quantity,included}]}
 
 function suggestProducts(query){
   const n = normName(query);
@@ -881,6 +908,8 @@ function viewListe(){
         ${chipSource.length ? chipSource.map(p=>`<button class="chip chip-btn" onclick="App.quickAddToList('${p.id}')">${p.favorite?'⭐ ':''}${esc(p.name)}</button>`).join('') : `<span style="font-size:12.5px; color:var(--muted)">Noch keine Vorschläge vorhanden.</span>`}
       </div>
     </div>
+
+    <button class="btn btn-accent2 btn-block" ${open.length?'':'disabled'} onclick="App.openReweOrderWizard()">🛒 Bei REWE bestellen</button>
 
     ${recurring.length ? `
     <div class="card">
@@ -968,6 +997,107 @@ function voiceDraftModalHtml(){
     <button type="button" class="btn btn-outline btn-block" onclick="App.closeModal()">Abbrechen</button>
     <button type="button" class="btn btn-primary btn-block" ${voiceDraft.length?'':'disabled'} onclick="App.confirmVoiceItems()">${voiceDraft.length ? voiceDraft.length+' hinzufügen' : 'Hinzufügen'}</button>
   </div>`;
+}
+
+/* ---- REWE-Bestellassistent: Modal-Schritte ---- */
+function reweWizardHtml(){
+  const d = reweOrderDraft; if(!d) return '';
+  if(d.step==='items') return reweWizardItemsStepHtml();
+  if(d.step==='summary') return reweWizardSummaryStepHtml();
+  return reweWizardMarketStepHtml();
+}
+function reweWizardMarketStepHtml(){
+  const d = reweOrderDraft;
+  const markets = store.markets.slice().sort((a,b)=> ((isReweMarket(b)?1:0)-(isReweMarket(a)?1:0)) || a.name.localeCompare(b.name));
+  const selected = d.marketId ? marketById(d.marketId) : null;
+  return `
+  <div class="modal-head"><h3>🛒 Bei REWE bestellen</h3><button class="icon-btn" onclick="App.reweWizardClose()">✕</button></div>
+  <p class="section-title">Schritt 1 von 3 · REWE-Markt auswählen</p>
+  <div class="stack" style="gap:0; max-height:340px; overflow-y:auto; margin-bottom:12px">
+    ${markets.map(m=>`
+    <div class="listitem" style="cursor:pointer; ${d.marketId===m.id?'background:var(--accent-soft)':''}" onclick="App.selectReweMarket('${m.id}')">
+      <div class="cat-icon" style="background:var(--plane)">${d.marketId===m.id?'✅':'🏬'}</div>
+      <div class="li-main">
+        <div class="li-title">${esc(m.name)} ${isReweMarket(m)?'<span class="badge badge-good">REWE</span>':''}</div>
+        <div class="li-meta">${marketAddressLines(m).length ? marketAddressLines(m).map(esc).join(' · ') : 'Keine Adresse hinterlegt'}</div>
+      </div>
+      <button class="iconbtn-sm" onclick="event.stopPropagation();App.openMarketModal('${m.id}')">✏️</button>
+    </div>`).join('')}
+  </div>
+  <button class="btn btn-outline btn-block" onclick="App.openMarketModal(null,'REWE')">➕ REWE-Markt hinzufügen</button>
+  ${selected && !selected.reweStoreId ? `
+  <div class="banner" style="margin-top:12px">ℹ️ Für „${esc(selected.name)}" ist noch keine eindeutige REWE-Markt-ID hinterlegt. Du kannst sie in der Marktverwaltung ergänzen oder trotzdem fortfahren – der Bestellvorgang wird dann über die REWE-Webseite abgeschlossen.
+    <div class="row" style="gap:8px; margin-top:8px; flex-wrap:wrap">
+      <button type="button" class="btn btn-outline btn-sm" onclick="App.openMarketModal('${selected.id}')">Markt bearbeiten</button>
+    </div>
+  </div>`:''}
+  <div class="row" style="gap:10px; margin-top:16px">
+    <button class="btn btn-outline btn-block" onclick="App.reweWizardCancel()">Abbrechen</button>
+    <button class="btn btn-primary btn-block" ${d.marketId?'':'disabled'} onclick="App.reweWizardGoToItems()">Weiter</button>
+  </div>`;
+}
+function reweWizardItemsStepHtml(){
+  const d = reweOrderDraft;
+  const market = marketById(d.marketId);
+  const includedCount = d.items.filter(i=>i.included).length;
+  return `
+  <div class="modal-head"><h3>🛒 Bei REWE bestellen</h3><button class="icon-btn" onclick="App.reweWizardClose()">✕</button></div>
+  <p class="section-title">Schritt 2 von 3 · Produkte prüfen · ${market?esc(market.name):''}</p>
+  <div class="stack" style="gap:0; max-height:420px; overflow-y:auto; margin-bottom:12px">
+    ${d.items.map((it,idx)=>{
+      const p = prodById(it.productId);
+      const matched = !!(p && (p.reweProductName || p.reweProductUrl || p.reweProductId));
+      return `
+      <div class="listitem" style="align-items:flex-start; ${it.included?'':'opacity:.5'}">
+        <button class="check ${it.included?'checked':''}" onclick="App.toggleReweDraftItemIncluded(${idx})">✓</button>
+        <div class="li-main">
+          <div class="li-title">${esc(it.name)}</div>
+          <div class="row" style="gap:8px; margin-top:6px; flex-wrap:wrap">
+            <input type="number" min="0" step="0.1" value="${it.quantity}" style="width:72px" oninput="App.updateReweDraftItem(${idx},'quantity',this.value)" ${it.included?'':'disabled'}>
+            <select style="width:116px" onchange="App.updateReweDraftItem(${idx},'unit',this.value)" ${it.included?'':'disabled'}>${unitSelectOptions(it.unit)}</select>
+            ${p && p.barcode ? `<span class="chip">🔢 ${esc(p.barcode)}</span>`:''}
+            ${p ? catChip(p.categoryId) : ''}
+          </div>
+          <div class="li-meta" style="margin-top:6px; ${matched?'color:var(--good)':'color:var(--warn)'}">
+            ${matched ? `✅ REWE-Zuordnung vorhanden${p.reweProductName?': '+esc(p.reweProductName):''}` : '⚠️ Kein eindeutiges REWE-Produkt gefunden'}
+          </div>
+          <div class="row" style="gap:8px; margin-top:6px; flex-wrap:wrap">
+            ${matched && p.reweProductUrl ? `<button type="button" class="btn btn-outline btn-sm" onclick="App.openReweProductLink('${it.productId}')">🔗 Öffnen</button>`:''}
+            <button type="button" class="btn btn-outline btn-sm" onclick="App.openProductModal('${it.productId}')">${matched?'Zuordnung bearbeiten':'Produkt auswählen'}</button>
+          </div>
+        </div>
+      </div>`;
+    }).join('')}
+  </div>
+  ${includedCount===0 ? `<div class="banner warn">⚠️ Wähle mindestens ein Produkt aus, um fortzufahren.</div>`:''}
+  <div class="row" style="gap:10px; margin-top:16px">
+    <button class="btn btn-outline btn-block" onclick="App.reweWizardBackToMarket()">Zurück</button>
+    <button class="btn btn-primary btn-block" ${includedCount?'':'disabled'} onclick="App.reweWizardGoToSummary()">Weiter</button>
+  </div>
+  <button class="btn btn-ghost btn-block" style="margin-top:6px" onclick="App.reweWizardCancel()">Bestellvorgang abbrechen</button>`;
+}
+function reweWizardSummaryStepHtml(){
+  const d = reweOrderDraft;
+  const market = marketById(d.marketId);
+  const items = d.items.filter(i=>i.included);
+  return `
+  <div class="modal-head"><h3>🛒 Bei REWE bestellen</h3><button class="icon-btn" onclick="App.reweWizardClose()">✕</button></div>
+  <p class="section-title">Schritt 3 von 3 · Bestellübersicht</p>
+  <div class="card" style="margin-bottom:12px">
+    <div style="font-weight:700; font-size:15px">${market?esc(market.name):''} ${market && isReweMarket(market)?'<span class="badge badge-good">REWE</span>':''}</div>
+    ${market ? marketAddressLines(market).map(l=>`<div style="font-size:12.5px; color:var(--muted)">${esc(l)}</div>`).join('') : ''}
+  </div>
+  <div class="card" style="margin-bottom:12px">
+    <div class="section-title">Artikel</div>
+    ${items.map(i=>`<div class="listitem" style="padding:8px 0"><div class="li-main"><div class="li-title" style="font-size:13.5px">${i.quantity} × ${esc(i.name)} <span style="color:var(--muted); font-weight:500">(${esc(i.unit)})</span></div></div></div>`).join('')}
+    <p style="font-size:12.5px; color:var(--muted); margin-top:8px">${items.length} Artikel</p>
+  </div>
+  <div class="banner">ℹ️ REWE bietet aktuell keine öffentliche Schnittstelle für eine automatische Bestellung an. Wochenkorb öffnet stattdessen die offizielle REWE-Seite – dort prüfst du Produkte, Mengen, Preise und Verfügbarkeit und schließt die Bestellung selbst ab. Ab dem Öffnen von REWE werden deine Daten dort von REWE verarbeitet.</div>
+  <div class="row" style="gap:10px; margin-top:16px">
+    <button class="btn btn-outline btn-block" onclick="App.reweWizardBackToItems()">Zurück</button>
+    <button class="btn btn-outline btn-block" onclick="App.reweWizardCancel()">Abbrechen</button>
+  </div>
+  <button class="btn btn-primary btn-block" style="margin-top:10px" onclick="App.reweWizardSubmit()">An REWE übergeben</button>`;
 }
 
 /* ============================= Scan ============================= */
@@ -1071,9 +1201,26 @@ function viewScanReview(){
 /* ============================= Historie ============================= */
 function viewVerlauf(){
   const list = store.shoppings.slice().sort((a,b)=>new Date(b.date)-new Date(a.date));
+  const reweOrders = store.reweOrders.slice().sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt));
   return `
   <div class="stack">
     <h1 style="font-size:22px">Einkaufshistorie</h1>
+    ${reweOrders.length ? `
+    <div class="card">
+      <h3 style="font-size:15px; margin-bottom:8px">REWE-Bestellungen</h3>
+      ${reweOrders.map(o=>`
+      <div class="listitem" style="flex-wrap:wrap">
+        <div class="cat-icon" style="background:var(--plane)">🛒</div>
+        <div class="li-main">
+          <div class="li-title">${esc(o.marketName||'REWE')} ${reweOrderStatusBadge(o.status)}</div>
+          <div class="li-meta">${fmtDateLong(o.createdAt)} · ${o.items.length} Artikel</div>
+          ${o.status==='prepared' || o.status==='redirected' ? `<div class="row" style="gap:8px; margin-top:8px; flex-wrap:wrap">
+            <button class="btn btn-outline btn-sm" onclick="App.reweRetryOpen('${o.id}')">${o.status==='prepared'?'REWE öffnen':'Erneut öffnen'}</button>
+            ${o.status==='redirected' ? `<button class="btn btn-outline btn-sm" onclick="App.reweMarkOrderCompleted('${o.id}')">Als abgeschlossen markieren</button>`:''}
+          </div>`:''}
+        </div>
+      </div>`).join('')}
+    </div>` : ''}
     ${list.length===0 ? `<div class="card">${emptyState('🕘','Noch keine Einkäufe vorhanden.','Schließe deinen ersten Einkauf ab oder scanne einen Kassenzettel.')}</div>` :
     list.map(s=>`
     <div class="card" onclick="App.nav('verlauf/${s.id}')" style="cursor:pointer">
@@ -1660,6 +1807,137 @@ function confirmVoiceItems(){
   else toast('Alle Produkte waren bereits auf der Liste.');
 }
 
+/* ---- REWE-Bestellassistent ---- */
+function isAllowedReweUrl(url){
+  try{
+    const u = new URL(String(url));
+    if(u.protocol!=='https:') return false;
+    return REWE_ALLOWED_HOSTS.includes(u.hostname.toLowerCase());
+  }catch(e){ return false; }
+}
+function openReweUrl(url){
+  if(!isAllowedReweUrl(url)){ toast('Diese REWE-Adresse ist ungültig.', true); return false; }
+  if(typeof navigator!=='undefined' && navigator.onLine===false){
+    toast('REWE konnte nicht geöffnet werden. Prüfe deine Internetverbindung und versuche es erneut.', true);
+    return false;
+  }
+  try{
+    const win = window.open(url, '_blank', 'noopener');
+    if(!win){ toast('Die REWE-Seite konnte nicht geöffnet werden. Du kannst REWE auch manuell öffnen.', true); return false; }
+    return true;
+  }catch(e){ toast('Die REWE-Seite konnte nicht geöffnet werden. Du kannst REWE auch manuell öffnen.', true); return false; }
+}
+function openReweProductLink(productId){
+  const p = prodById(productId); if(!p || !p.reweProductUrl) return;
+  openReweUrl(p.reweProductUrl);
+}
+function attemptReweRedirect(record){
+  const ok = openReweUrl(REWE_SHOP_URL);
+  if(ok){ record.status='redirected'; record.redirectedAt=nowIso(); saveStore(); }
+  return ok;
+}
+
+function closeModalOrResumeRewe(){
+  if(reweOrderDraft){ openModal(reweWizardHtml()); } else { closeModal(); }
+}
+function openReweOrderWizard(){
+  if(!reweOrderDraft){
+    const open = store.shoppingList.filter(i=>!i.checked);
+    if(!open.length){ toast('Deine Einkaufsliste enthält keine bestellbaren Artikel.', true); return; }
+    reweOrderDraft = {
+      step:'market', marketId:null, orderId:null,
+      items: open.slice().sort((a,b)=>a.order-b.order).map(i=>({ productId:i.productId, name:i.name, unit:i.unit, quantity:i.quantity, included:true })),
+    };
+  }
+  openModal(reweWizardHtml());
+}
+function reweWizardClose(){ closeModal(); }
+function reweWizardCancel(){
+  if(reweOrderDraft && reweOrderDraft.orderId){
+    const rec = store.reweOrders.find(o=>o.id===reweOrderDraft.orderId);
+    if(rec && (rec.status==='prepared')){ rec.status='cancelled'; rec.cancelledAt=nowIso(); saveStore(); }
+  }
+  reweOrderDraft = null;
+  closeModal();
+  toast('Bestellvorgang abgebrochen.');
+}
+function selectReweMarket(marketId){
+  if(!reweOrderDraft) return;
+  reweOrderDraft.marketId = marketId;
+  openModal(reweWizardHtml());
+}
+function reweWizardGoToItems(){
+  if(!reweOrderDraft) return;
+  if(!reweOrderDraft.marketId){ toast('Bitte wähle zuerst einen REWE-Markt aus.', true); return; }
+  reweOrderDraft.step = 'items';
+  openModal(reweWizardHtml());
+}
+function reweWizardBackToMarket(){
+  if(!reweOrderDraft) return;
+  reweOrderDraft.step = 'market';
+  openModal(reweWizardHtml());
+}
+function toggleReweDraftItemIncluded(idx){
+  if(!reweOrderDraft || !reweOrderDraft.items[idx]) return;
+  reweOrderDraft.items[idx].included = !reweOrderDraft.items[idx].included;
+  openModal(reweWizardHtml());
+}
+function updateReweDraftItem(idx, field, val){
+  if(!reweOrderDraft || !reweOrderDraft.items[idx]) return;
+  reweOrderDraft.items[idx][field] = field==='quantity' ? (parseFloat(val)||0) : val;
+}
+function reweWizardGoToSummary(){
+  if(!reweOrderDraft) return;
+  const included = reweOrderDraft.items.filter(i=>i.included);
+  if(!included.length){ toast('Deine Einkaufsliste enthält keine bestellbaren Artikel.', true); return; }
+  if(!reweOrderDraft.orderId){
+    const market = marketById(reweOrderDraft.marketId);
+    const record = {
+      id: uid(), marketId: reweOrderDraft.marketId, marketName: market ? market.name : '',
+      createdAt: nowIso(), status:'prepared', redirectedAt:null, completedAt:null, cancelledAt:null,
+      items: included.map(i=>{
+        const p = prodById(i.productId);
+        return { productId:i.productId, name:i.name, quantity:i.quantity, unit:i.unit,
+          reweProductId: (p && p.reweProductId) || null, reweProductName: (p && p.reweProductName) || null, reweProductUrl: (p && p.reweProductUrl) || null };
+      }),
+    };
+    store.reweOrders.unshift(record);
+    reweOrderDraft.orderId = record.id;
+    saveStore();
+  }
+  reweOrderDraft.step = 'summary';
+  openModal(reweWizardHtml());
+}
+function reweWizardBackToItems(){
+  if(!reweOrderDraft) return;
+  reweOrderDraft.step = 'items';
+  openModal(reweWizardHtml());
+}
+function reweWizardSubmit(){
+  if(!reweOrderDraft || !reweOrderDraft.orderId) return;
+  const record = store.reweOrders.find(o=>o.id===reweOrderDraft.orderId);
+  if(!record) return;
+  const ok = attemptReweRedirect(record);
+  if(ok){
+    reweOrderDraft = null;
+    closeModal();
+    render();
+    toast('REWE wurde geöffnet. Prüfe dort Produkte, Mengen, Preise und Verfügbarkeit und schließe die Bestellung bei REWE ab.');
+  }
+}
+function reweRetryOpen(orderId){
+  const record = store.reweOrders.find(o=>o.id===orderId); if(!record) return;
+  const ok = attemptReweRedirect(record);
+  render();
+  if(ok) toast('REWE wurde erneut geöffnet.');
+}
+function reweMarkOrderCompleted(orderId){
+  const record = store.reweOrders.find(o=>o.id===orderId); if(!record) return;
+  record.status='completed'; record.completedAt=nowIso();
+  saveStore(); render();
+  toast('Als abgeschlossen markiert.');
+}
+
 function recurringCandidates(){
   const list = store.shoppingList;
   return store.products.filter(p=>{
@@ -2048,7 +2326,7 @@ function toggleFavorite(id){ const p=prodById(id); if(!p) return; p.favorite=!p.
 function openProductModal(id, prefillBarcode){
   const p = id ? prodById(id) : null;
   openModal(`
-  <div class="modal-head"><h3>${p?'Produkt bearbeiten':'Neues Produkt'}</h3><button class="icon-btn" onclick="App.closeModal()">✕</button></div>
+  <div class="modal-head"><h3>${p?'Produkt bearbeiten':'Neues Produkt'}</h3><button class="icon-btn" onclick="App.closeModalOrResumeRewe()">✕</button></div>
   <form onsubmit="return App.saveProductForm(event${p?`,'${p.id}'`:''})">
     <label class="field">Name<input type="text" name="name" required value="${p?escAttr(p.name):''}" autofocus></label>
     <div class="field-row" style="margin-top:10px">
@@ -2062,8 +2340,14 @@ function openProductModal(id, prefillBarcode){
     <label class="field" style="margin-top:10px">Barcode (optional)<input type="text" name="barcode" inputmode="numeric" value="${p && p.barcode?escAttr(p.barcode):esc(prefillBarcode||'')}"></label>
     <label class="field" style="margin-top:10px">Notiz<textarea name="note">${p?esc(p.note||''):''}</textarea></label>
     <label class="row" style="margin-top:10px; gap:8px; font-weight:600; font-size:13.5px"><input type="checkbox" name="favorite" ${p&&p.favorite?'checked':''} style="width:18px;height:18px"> Favorit</label>
+    <hr class="hairline">
+    <div class="section-title">REWE-Zuordnung (optional)</div>
+    <p style="font-size:11.5px; color:var(--muted); margin:-4px 0 10px">Wochenkorb kann kein REWE-Produkt automatisch finden. Trage hier nur ein, was du selbst im REWE-Onlineshop gefunden hast.</p>
+    <label class="field">REWE-Produktname<input type="text" name="reweProductName" value="${p&&p.reweProductName?escAttr(p.reweProductName):''}" placeholder="z. B. REWE Bio Frische Vollmilch 3,8%"></label>
+    <label class="field" style="margin-top:10px">REWE-Produkt-Link<input type="text" name="reweProductUrl" value="${p&&p.reweProductUrl?escAttr(p.reweProductUrl):''}" placeholder="https://shop.rewe.de/…"></label>
+    <label class="field" style="margin-top:10px">REWE-Produkt-ID (optional)<input type="text" name="reweProductId" value="${p&&p.reweProductId?escAttr(p.reweProductId):''}"></label>
     <div class="row" style="gap:10px; margin-top:16px">
-      <button type="button" class="btn btn-outline btn-block" onclick="App.closeModal()">Abbrechen</button>
+      <button type="button" class="btn btn-outline btn-block" onclick="App.closeModalOrResumeRewe()">Abbrechen</button>
       <button type="submit" class="btn btn-primary btn-block">Speichern</button>
     </div>
   </form>`);
@@ -2072,17 +2356,27 @@ function saveProductForm(ev, id){
   ev.preventDefault(); const f=ev.target; const name=f.name.value.trim(); if(!name) return false;
   const barcode = f.barcode.value.trim() || null;
   if(barcode && store.products.some(p=>p.barcode===barcode && p.id!==id)){ toast('Barcode wird bereits verwendet.', true); return false; }
+  const reweProductUrl = f.reweProductUrl.value.trim() || null;
+  if(reweProductUrl && !isAllowedReweUrl(reweProductUrl)){
+    toast('Der REWE-Produkt-Link muss auf rewe.de bzw. shop.rewe.de verweisen.', true); return false;
+  }
+  const reweProductName = f.reweProductName.value.trim() || null;
+  const reweProductId = f.reweProductId.value.trim() || null;
+  const reweLastMatchedAt = (reweProductName || reweProductUrl || reweProductId) ? nowIso() : null;
   if(id){
     const p = prodById(id);
     p.name=name; p.categoryId=f.categoryId.value; p.defaultUnit=f.defaultUnit.value;
     p.defaultQuantity=parseFloat(f.defaultQuantity.value)||1; p.defaultPrice = f.defaultPrice.value!=='' ? parseFloat(f.defaultPrice.value) : null;
     p.barcode=barcode; p.note=f.note.value.trim(); p.favorite=f.favorite.checked; p.updatedAt=nowIso();
+    p.reweProductName=reweProductName; p.reweProductUrl=reweProductUrl; p.reweProductId=reweProductId; p.reweLastMatchedAt=reweLastMatchedAt;
   } else {
     store.products.push({ id:uid(), name, categoryId:f.categoryId.value, barcode, defaultQuantity: parseFloat(f.defaultQuantity.value)||1,
       defaultUnit:f.defaultUnit.value, defaultPrice: f.defaultPrice.value!=='' ? parseFloat(f.defaultPrice.value) : null, favorite:f.favorite.checked,
-      note:f.note.value.trim(), createdAt:nowIso(), updatedAt:nowIso(), lastPurchasedAt:null, purchaseCount:0, isDemo:false });
+      note:f.note.value.trim(), createdAt:nowIso(), updatedAt:nowIso(), lastPurchasedAt:null, purchaseCount:0, isDemo:false,
+      reweProductName, reweProductUrl, reweProductId, reweLastMatchedAt });
   }
-  saveStore(); closeModal(); render(); toast('Produkt gespeichert');
+  saveStore(); render(); toast('Produkt gespeichert');
+  closeModalOrResumeRewe();
   return false;
 }
 function deleteProduct(id){
@@ -2140,26 +2434,38 @@ function deleteCategory(id){
 
 /* ---- Märkte ---- */
 function setMarketPriceProduct(id){ marketPriceProduct=id; render(); }
-function openMarketModal(id){
+function openMarketModal(id, prefillName){
   const m = id ? marketById(id) : null;
   openModal(`
-  <div class="modal-head"><h3>${m?'Markt bearbeiten':'Neuer Markt'}</h3><button class="icon-btn" onclick="App.closeModal()">✕</button></div>
+  <div class="modal-head"><h3>${m?'Markt bearbeiten':'Neuer Markt'}</h3><button class="icon-btn" onclick="App.closeModalOrResumeRewe()">✕</button></div>
   <form onsubmit="return App.saveMarketForm(event${m?`,'${m.id}'`:''})">
-    <label class="field">Name<input type="text" name="name" required value="${m?escAttr(m.name):''}" autofocus></label>
+    <label class="field">Name<input type="text" name="name" required value="${m?escAttr(m.name):esc(prefillName||'')}" autofocus></label>
+    <label class="field" style="margin-top:10px">Adresse (optional)<input type="text" name="street" value="${m&&m.street?escAttr(m.street):''}" placeholder="Musterstraße 12"></label>
+    <div class="field-row" style="margin-top:10px">
+      <label class="field">PLZ (optional)<input type="text" name="zip" inputmode="numeric" value="${m&&m.zip?escAttr(m.zip):''}" placeholder="76437"></label>
+      <label class="field">Ort (optional)<input type="text" name="city" value="${m&&m.city?escAttr(m.city):''}" placeholder="Rastatt"></label>
+    </div>
+    <label class="field" style="margin-top:10px">REWE-Markt-ID (optional)<input type="text" name="reweStoreId" value="${m&&m.reweStoreId?escAttr(m.reweStoreId):''}" placeholder="Nur eintragen, wenn dir die echte Kennung bekannt ist"></label>
     <div class="row" style="gap:10px; margin-top:16px">
-      <button type="button" class="btn btn-outline btn-block" onclick="App.closeModal()">Abbrechen</button>
+      <button type="button" class="btn btn-outline btn-block" onclick="App.closeModalOrResumeRewe()">Abbrechen</button>
       <button type="submit" class="btn btn-primary btn-block">Speichern</button>
     </div>
   </form>`);
 }
 function saveMarketForm(ev, id){
   ev.preventDefault(); const f=ev.target; const name=f.name.value.trim(); if(!name) return false;
+  const street = f.street.value.trim() || null;
+  const zip = f.zip.value.trim() || null;
+  const city = f.city.value.trim() || null;
+  const reweStoreId = f.reweStoreId.value.trim() || null;
   if(id){
     const m=marketById(id); const oldName=m.name; m.name=name;
+    m.street=street; m.zip=zip; m.city=city; m.reweStoreId=reweStoreId;
     store.shoppings.forEach(s=>{ if(s.market===oldName) s.market=name; });
     store.priceHistory.forEach(p=>{ if(p.market===oldName) p.market=name; });
-  } else { store.markets.push({id:'mkt_'+uid(), name, isDefault:false}); }
-  saveStore(); closeModal(); render(); toast('Markt gespeichert');
+  } else { store.markets.push({id:'mkt_'+uid(), name, isDefault:false, street, zip, city, reweStoreId}); }
+  saveStore(); render(); toast('Markt gespeichert');
+  closeModalOrResumeRewe();
   return false;
 }
 function deleteMarket(id){
@@ -2275,6 +2581,7 @@ function importJson(ev){
         if(!store.settings) store.settings = { theme:'system', firstRunDone:true, demoActive:false, recurringTemplate:[] };
         if(!store.categoryCorrections) store.categoryCorrections = {};
         if(!Array.isArray(store.priceHistory)) store.priceHistory = [];
+        if(!Array.isArray(store.reweOrders)) store.reweOrders = [];
         saveStore(); applyTheme(); closeModal(); nav(''); toast('Daten importiert');
       });
     }catch(e){ toast('Datei konnte nicht gelesen werden – ungültiges JSON.', true); }
@@ -2311,6 +2618,9 @@ function finishOnboarding(withDemo){
 const App = {
   nav, toggleItem, removeItem, moveItem, toggleReorder, setListTab, onListSearch, quickAddToList, quickAddByName,
   startVoiceInput, updateVoiceDraftItem, removeVoiceDraftItem, confirmVoiceItems,
+  openReweOrderWizard, reweWizardClose, reweWizardCancel, closeModalOrResumeRewe, selectReweMarket, reweWizardGoToItems,
+  reweWizardBackToMarket, toggleReweDraftItemIncluded, updateReweDraftItem, reweWizardGoToSummary, reweWizardBackToItems,
+  reweWizardSubmit, reweRetryOpen, reweMarkOrderCompleted, openReweProductLink,
   addAllRecurring, addTemplateToList, editItem, saveItemForm, openCompletePurchase, updateCompleteTotal, completePurchase,
   onReceiptFile, startManualEntry, resetScan, cancelScan, confirmScan, updateDraft, updateDraftItem, addDraftItem, removeDraftItem,
   openBarcodeModal, submitBarcode, openEditShopping, saveShoppingForm, deleteShopping, setStatFilter, setStatCustom, setStatProduct,
