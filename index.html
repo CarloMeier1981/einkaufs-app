@@ -445,7 +445,9 @@ const DEMO_PRODUCT_POOL = [
 
 /* ============================= Store / persistence ============================= */
 const STORAGE_KEY = 'wochenkorb.store.v1';
-let storageOK = true;
+const IDB_NAME = 'wochenkorb', IDB_STORE = 'kv', IDB_KEY = 'store';
+let storageOK = true;      // true solange mindestens ein Speicher (localStorage oder IndexedDB) funktioniert
+let lsOK = true, idbOK = false, persistGranted = false, restoredFromBackup = false;
 let store = null;
 
 function freshStore(){
@@ -470,22 +472,129 @@ function seedDefaults(s){
     s.markets = DEFAULT_MARKETS.map(m => ({id:'mkt_'+normName(m).replace(/\s+/g,'-'), name:m, isDefault:true}));
   }
 }
-function loadStore(){
+function parseStoreJson(raw){
   try{
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if(raw){ store = JSON.parse(raw); }
-    else { store = freshStore(); }
-  }catch(e){ storageOK=false; store = freshStore(); }
+    const s = JSON.parse(raw);
+    return (s && typeof s==='object' && Array.isArray(s.products) && Array.isArray(s.shoppings)) ? s : null;
+  }catch(e){ return null; }
+}
+function normalizeStore(){
   seedDefaults(store);
   if(!store.settings) store.settings = { theme:'system', firstRunDone:false, demoActive:false, recurringTemplate:[] };
   if(!store.categoryCorrections) store.categoryCorrections = {};
   if(!Array.isArray(store.priceHistory)) store.priceHistory = [];
   if(!Array.isArray(store.reweOrders)) store.reweOrders = [];
 }
+/* Lädt synchron aus localStorage. Ein defekter Eintrag wird nie überschrieben, sondern unter ".corrupt" aufgehoben. */
+function loadStore(){
+  let raw = null, parsed = null;
+  try{ raw = localStorage.getItem(STORAGE_KEY); }catch(e){ lsOK = false; }
+  if(raw){
+    parsed = parseStoreJson(raw);
+    if(!parsed){ try{ localStorage.setItem(STORAGE_KEY+'.corrupt', raw); }catch(e){} }
+  }
+  store = parsed || freshStore();
+  normalizeStore();
+  return !!parsed;
+}
+
+/* ---- IndexedDB-Spiegel: zweite, größere Kopie, falls localStorage geleert wird, blockiert ist oder überläuft ---- */
+let idbPromise = null;
+function idbOpen(){
+  if(idbPromise) return idbPromise;
+  idbPromise = new Promise((resolve, reject)=>{
+    if(!window.indexedDB){ reject(new Error('IndexedDB nicht verfügbar')); return; }
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+    req.onsuccess = () => {
+      const db = req.result;
+      db.onversionchange = () => { db.close(); idbPromise = null; };
+      db.onclose = () => { idbPromise = null; };
+      resolve(db);
+    };
+    req.onerror = () => reject(req.error);
+    req.onblocked = () => reject(new Error('IndexedDB blockiert'));
+  });
+  idbPromise.catch(()=>{ idbPromise = null; });
+  return idbPromise;
+}
+async function idbRead(){
+  const db = await idbOpen();
+  return new Promise((resolve, reject)=>{
+    const r = db.transaction(IDB_STORE,'readonly').objectStore(IDB_STORE).get(IDB_KEY);
+    r.onsuccess = () => resolve(r.result || null);
+    r.onerror = () => reject(r.error);
+  });
+}
+async function idbWrite(json){
+  const db = await idbOpen();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction(IDB_STORE,'readwrite');
+    tx.objectStore(IDB_STORE).put(json, IDB_KEY);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+let idbPending = null, idbBusy = false;
+function mirrorToIdb(json){
+  idbPending = json;
+  if(idbBusy) return;
+  idbBusy = true;
+  (async()=>{
+    try{
+      while(idbPending !== null){ const j = idbPending; idbPending = null; await idbWrite(j); }
+      idbOK = true;
+    }catch(e){ idbOK = false; }
+    finally{ idbBusy = false; storageOK = lsOK || idbOK; }
+  })();
+}
+function withTimeout(promise, ms){
+  return Promise.race([promise, new Promise((_,rej)=>setTimeout(()=>rej(new Error('Zeitüberschreitung')), ms))]);
+}
+async function requestPersistentStorage(){
+  try{
+    if(navigator.storage && navigator.storage.persist){
+      persistGranted = (await navigator.storage.persisted()) || (await navigator.storage.persist());
+    }
+  }catch(e){ persistGranted = false; }
+  return persistGranted;
+}
+async function askPersistentStorage(){
+  const ok = await requestPersistentStorage();
+  render();
+  toast(ok ? 'Dauerhafter Speicher aktiv – der Browser löscht die Daten nicht mehr von selbst.' : 'Der Browser hat dauerhaften Speicher nicht gewährt. Bitte regelmäßig eine Sicherung exportieren.', !ok);
+}
+/* Beim Start: localStorage laden, IndexedDB-Spiegel prüfen und – falls dort die neuere (oder einzige) Kopie liegt – wiederherstellen. */
+async function initStore(){
+  const hadLs = loadStore();
+  let rec = null;
+  try{
+    rec = await withTimeout(idbRead(), 2500);
+    idbOK = true;
+    const snap = rec ? parseStoreJson(rec) : null;
+    if(snap && (!hadLs || String(snap.savedAt||'') > String(store.savedAt||''))){
+      store = snap; normalizeStore(); restoredFromBackup = true;
+      try{ localStorage.setItem(STORAGE_KEY, rec); lsOK = true; }catch(e){ lsOK = false; }
+    }
+  }catch(e){ idbOK = false; }
+  storageOK = lsOK || idbOK;
+  if(idbOK && !rec && hadLs){ try{ mirrorToIdb(JSON.stringify(store)); }catch(e){} }
+  requestPersistentStorage();
+}
 function saveStore(){
-  if(!storageOK) return;
-  try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(store)); }
-  catch(e){ storageOK=false; toast('Lokaler Speicher nicht verfügbar – Änderungen werden evtl. nicht gespeichert.', true); }
+  let json;
+  store.savedAt = nowIso();
+  try{ json = JSON.stringify(store); }
+  catch(e){ toast('Speichern fehlgeschlagen.', true); return; }
+  const wasOk = lsOK;
+  try{ localStorage.setItem(STORAGE_KEY, json); lsOK = true; }
+  catch(e){ lsOK = false; }
+  mirrorToIdb(json);
+  storageOK = lsOK || idbOK;
+  if(wasOk && !lsOK){
+    toast(idbOK ? 'Browser-Speicher voll oder gesperrt – Daten werden in der Ersatz-Datenbank gesichert.' : 'Lokaler Speicher nicht verfügbar – Änderungen werden evtl. nicht gespeichert.', true);
+  }
 }
 function catById(id){ return store.categories.find(c=>c.id===id); }
 function catByName(name){ return store.categories.find(c=>normName(c.name)===normName(name)); }
@@ -649,6 +758,7 @@ function render(){
     console.error(err);
     html = `<div class="card"><div class="empty"><span class="emoji">⚠️</span><div class="t1">Etwas ist schiefgelaufen</div><p>${esc(err.message)}</p></div></div>`;
   }
+  if(!storageOK) html = `<div class="banner warn" style="margin-bottom:16px">⚠️ Der Browser-Speicher ist nicht verfügbar. Deine Daten gehen beim Schließen der App verloren – bitte regelmäßig unter Einstellungen eine Sicherung exportieren.</div>` + html;
   view.innerHTML = html;
   window.scrollTo(0,0);
   afterRender(path);
@@ -763,7 +873,6 @@ function viewDashboard(){
 
   return `
   <div class="stack">
-    ${!storageOK ? `<div class="banner warn">⚠️ Lokaler Speicher ist nicht verfügbar. Deine Änderungen werden für diese Sitzung nur temporär gehalten.</div>` : ''}
     <div>
       <div class="section-title">Diese Woche · ${weekLabel(wStart)}–${weekLabel(wEnd)}</div>
       <h1 style="font-size:26px">Hallo! 👋</h1>
@@ -1594,6 +1703,19 @@ function viewSuche(){
 }
 
 /* ============================= Einstellungen ============================= */
+function storageHintHtml(){
+  const ua = navigator.userAgent || '';
+  const isIos = /iphone|ipad|ipod/i.test(ua) || (navigator.platform==='MacIntel' && navigator.maxTouchPoints>1);
+  const isStandalone = navigator.standalone===true || (window.matchMedia && matchMedia('(display-mode: standalone)').matches);
+  const hints = [];
+  if(window.claude && window.claude.use){
+    hints.push('Diese Ansicht läuft innerhalb von Claude und speichert Daten eventuell nicht dauerhaft. Für zuverlässige Speicherung nutze die Web-Version: carlomeier1981.github.io/einkaufs-app');
+  }
+  if(isIos && !isStandalone){
+    hints.push('iPhone/iPad: Safari löscht Website-Daten nach 7 Tagen ohne Nutzung. Tippe auf „Teilen" → „Zum Home-Bildschirm" und öffne Wochenkorb künftig nur über dieses Symbol – dort bleiben die Daten erhalten. Das Symbol hat einen eigenen Speicher: Exportiere deine Daten vorher hier (JSON) und importiere sie im neuen Symbol.');
+  }
+  return hints.map(h=>`<div class="banner" style="margin-bottom:10px; font-weight:500">📱 <span>${esc(h)}</span></div>`).join('');
+}
 function viewEinstellungen(){
   const theme = store.settings.theme;
   return `
@@ -1630,6 +1752,12 @@ function viewEinstellungen(){
     <div class="card">
       <h3 style="font-size:15px; margin-bottom:6px">Daten &amp; Datenschutz</h3>
       <p style="font-size:12.5px; color:var(--muted); margin-bottom:10px">Alle Daten (Produkte, Einkäufe, Kassenzettel-Fotos) werden ausschließlich lokal auf diesem Gerät gespeichert.</p>
+      <p style="font-size:12.5px; color:var(--ink-2); margin-bottom:10px">
+        Speicherstatus: Browser-Speicher ${lsOK?'✅':'⚠️'} · Ersatz-Datenbank ${idbOK?'✅':'⚠️'} · Dauerhaft geschützt ${persistGranted?'✅ ja':'⚠️ nicht garantiert'}
+        ${store.savedAt ? `<br>Zuletzt gespeichert: ${fmtDate(store.savedAt, {day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'})}` : ''}
+      </p>
+      ${storageHintHtml()}
+      ${persistGranted ? '' : `<button class="btn btn-outline btn-sm" style="margin-bottom:10px" onclick="App.askPersistentStorage()">🔒 Dauerhaften Speicher anfordern</button>`}
       <div class="row" style="gap:8px; flex-wrap:wrap">
         <button class="btn btn-outline btn-sm" onclick="App.exportJson()">⬇️ Export (JSON)</button>
         <button class="btn btn-outline btn-sm" onclick="App.exportCsv()">⬇️ Export Historie (CSV)</button>
@@ -2627,14 +2755,17 @@ const App = {
   setProdSearch, setProdFilterCat, setProdFilterCatAndGo, toggleFavorite, openProductModal, saveProductForm, deleteProduct,
   openCategoryModal, saveCategoryForm, deleteCategory, setMarketPriceProduct, openMarketModal, saveMarketForm, deleteMarket,
   setSearchQuery, openRecurringTemplateModal, saveRecurringTemplate, setTheme, loadDemoData, confirmRemoveDemo, confirmDeleteAll,
-  exportJson, exportCsv, importJson, closeModal, finishOnboarding,
+  exportJson, exportCsv, importJson, closeModal, finishOnboarding, askPersistentStorage,
 };
 
 /* ============================= Boot ============================= */
-loadStore();
-applyTheme();
-window.addEventListener('hashchange', render);
-render();
-if(!store.settings.firstRunDone){ showOnboarding(); }
+function startApp(){
+  applyTheme();
+  window.addEventListener('hashchange', render);
+  render();
+  if(restoredFromBackup) toast('Deine Daten wurden aus der Sicherungskopie wiederhergestellt.');
+  if(!store.settings.firstRunDone){ showOnboarding(); }
+}
+initStore().catch(()=>{ if(!store) loadStore(); }).then(startApp);
 </script>
 
