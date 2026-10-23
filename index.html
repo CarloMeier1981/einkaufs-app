@@ -1708,6 +1708,9 @@ function storageHintHtml(){
   const isIos = /iphone|ipad|ipod/i.test(ua) || (navigator.platform==='MacIntel' && navigator.maxTouchPoints>1);
   const isStandalone = navigator.standalone===true || (window.matchMedia && matchMedia('(display-mode: standalone)').matches);
   const hints = [];
+  if(offlineSupported() && !offlineReady()){
+    hints.push('Damit Wochenkorb im Supermarkt ohne Netz funktioniert, öffne die App einmal mit Internet und lade sie danach neu.');
+  }
   if(window.claude && window.claude.use){
     hints.push('Diese Ansicht läuft innerhalb von Claude und speichert Daten eventuell nicht dauerhaft. Für zuverlässige Speicherung nutze die Web-Version: carlomeier1981.github.io/einkaufs-app');
   }
@@ -1753,7 +1756,7 @@ function viewEinstellungen(){
       <h3 style="font-size:15px; margin-bottom:6px">Daten &amp; Datenschutz</h3>
       <p style="font-size:12.5px; color:var(--muted); margin-bottom:10px">Alle Daten (Produkte, Einkäufe, Kassenzettel-Fotos) werden ausschließlich lokal auf diesem Gerät gespeichert.</p>
       <p style="font-size:12.5px; color:var(--ink-2); margin-bottom:10px">
-        Speicherstatus: Browser-Speicher ${lsOK?'✅':'⚠️'} · Ersatz-Datenbank ${idbOK?'✅':'⚠️'} · Dauerhaft geschützt ${persistGranted?'✅ ja':'⚠️ nicht garantiert'}
+        Speicherstatus: Browser-Speicher ${lsOK?'✅':'⚠️'} · Ersatz-Datenbank ${idbOK?'✅':'⚠️'} · Dauerhaft geschützt ${persistGranted?'✅ ja':'⚠️ nicht garantiert'}${offlineSupported() ? ` · Offline-Nutzung ${offlineReady()?'✅ bereit':'⚠️ noch nicht eingerichtet'}` : ''}
         ${store.savedAt ? `<br>Zuletzt gespeichert: ${fmtDate(store.savedAt, {day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'})}` : ''}
       </p>
       ${storageHintHtml()}
@@ -2220,6 +2223,7 @@ async function runRealScan(imageData){
   scanState = { status:'scanning', imageData, draft:null, error:null, progress:0 };
   render();
   try{
+    if(navigator.onLine===false && !window.Tesseract) throw new Error('Du bist offline. Die Texterkennung braucht beim ersten Scan Internet – erfasse den Einkauf stattdessen manuell.');
     const Tesseract = await loadTesseract();
     const { data } = await Tesseract.recognize(imageData, 'deu', {
       tessedit_pageseg_mode: '6', // "einheitlicher Textblock" statt automatischer Layout-Erkennung – zuverlässiger für schmale Kassenzettel-Spalten
@@ -2759,10 +2763,26 @@ const App = {
 };
 
 /* ============================= Boot ============================= */
+/* Offline-Nutzung: Service Worker (sw.js) nur ueber http(s); im Claude-Artifact und unter file:// bewusst aus. */
+function offlineSupported(){
+  return 'serviceWorker' in navigator && /^https?:$/.test(location.protocol) && !(window.claude && window.claude.use);
+}
+function offlineReady(){ return !!(offlineSupported() && navigator.serviceWorker.controller); }
+function setupOffline(){
+  window.addEventListener('offline', ()=>toast('Du bist offline – deine Einkaufsliste funktioniert weiter.'));
+  window.addEventListener('online', ()=>toast('Wieder online.'));
+  if(!offlineSupported()) return;
+  navigator.serviceWorker.addEventListener('message', (e)=>{
+    if(e.data && e.data.type==='update-ready') toast('Neue Version geladen – sie ist beim nächsten Öffnen aktiv.');
+  });
+  navigator.serviceWorker.addEventListener('controllerchange', ()=>{ if(currentRoute().path==='einstellungen') render(); });
+  navigator.serviceWorker.register('sw.js').catch(()=>{});
+}
 function startApp(){
   applyTheme();
   window.addEventListener('hashchange', render);
   render();
+  setupOffline();
   if(restoredFromBackup) toast('Deine Daten wurden aus der Sicherungskopie wiederhergestellt.');
   if(!store.settings.firstRunDone){ showOnboarding(); }
 }
